@@ -57,7 +57,7 @@ class BaseTaskSampler:
 
     agent_pos: chex.Array = field(init=False)
     goal_pos: chex.Array = field(init=False)
-    agent_forward_dir: chex.Array = field(init=False, default=jnp.array([0.0, 1.0]))
+    agent_forward_dir: chex.Array = field(init=False, default_factory=lambda: jnp.array([0.0, 1.0]))
     agent_goal_dir: chex.Array = field(init=False)
 
     static_obstacles: chex.Array = field(init=False)
