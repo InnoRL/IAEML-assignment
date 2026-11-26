@@ -1,6 +1,6 @@
 # IAEML: robotaxi
 
-Курсовой проект IAEML: 2D-среда «robotaxi» на JAX (динамическая bicycle-модель,
+IAEML: 2D-среда «robotaxi» на JAX (динамическая bicycle-модель,
 пространство наблюдений, функция награды) и обучение агента алгоритмом PPO.
 
 ## Отчёты
@@ -10,8 +10,6 @@
 | 1. Environment | модель динамики, наблюдения, награда | [`reports/IAEML_Assignment1_report.pdf`](reports/IAEML_Assignment1_report.pdf) |
 | 2. ML | PPO, оптимизация вычислений, эксперименты | [`reports/IAEML_Assignment2_report.pdf`](reports/IAEML_Assignment2_report.pdf) |
 
-Рисунки к каждому отчёту лежат в папке этого отчёта. Компилировать два раза
-(`pdflatex`), чтобы подставились ссылки.
 
 ## Структура
 
