@@ -21,6 +21,7 @@ RL training (Assignment 2).
 """
 
 import jax
+import numpy as np
 from jax import numpy as jnp
 import equinox
 import chex
@@ -63,6 +64,12 @@ MAX_ACCEL = 2.5   # max |longitudinal acceleration| [cells / s^2]
 MAX_STEER = 0.6   # max |steering angle| [rad]
 NORMALIZE_ACTIONS = True  # if True, both action components live in [-1, 1]
 ACTION_REPEAT = 1  # physics substeps of dt = 1/fps per env step
+PLUG_SLITS = False  # True: close single-cell gaps between two walls (zero clearance, impassable)
+PLAN_STATIC_ONLY = False  # True: the DP path ignores moving obstacles (static map only);
+                          # use together with replan_period > 0
+PROGRESS_ON_PATH = False  # True: progress reward measured along the DP path (not a straight line)
+REPLAN_PERIOD = 0   # 0: legacy BaseEnv behaviour (DP inside step); K>0: no DP in step,
+                    # paths are refreshed from outside with RoboTaxiEnv.replan (fast training)
 
 # reward weights
 W_PROGRESS = 5.0    # potential-based progress towards the goal
@@ -99,6 +106,10 @@ class RoboTaxiParams(BaseEnvParams):
     max_steer: float = MAX_STEER
     normalize_actions: bool = NORMALIZE_ACTIONS
     action_repeat: int = ACTION_REPEAT
+    replan_period: int = REPLAN_PERIOD
+    progress_on_path: bool = PROGRESS_ON_PATH
+    plan_static_only: bool = PLAN_STATIC_ONLY
+    plug_slits: bool = PLUG_SLITS
     # reward
     w_progress: float = W_PROGRESS
     w_path: float = W_PATH
@@ -257,13 +268,21 @@ class RoboTaxiEnv(BaseEnv):
             collided=jnp.asarray(False),
             prev_dist_to_goal=jnp.linalg.norm(agent_pos - goal_pos),
         )
-        obstacles = jnp.concatenate(
-            [init_state.static_obstacles, init_state.kinematic_obstacles], axis=0
+        if env_params.plug_slits:
+            init_state = RoboTaxiEnv._plug_slits(init_state, env_params)
+        obstacles = RoboTaxiEnv._planning_obstacles(
+            init_state.static_obstacles, init_state.kinematic_obstacles, env_params
         )
         path_array = BaseEnv._find_path(
             agent_pos, goal_pos, obstacles, env_params
         )
-        init_state = equinox.tree_at(lambda t: t.path_array, init_state, path_array)
+        potential0 = RoboTaxiEnv._progress_potential(
+            agent_pos, path_array, goal_pos, env_params
+        )
+        init_state = equinox.tree_at(
+            lambda t: (t.path_array, t.prev_dist_to_goal),
+            init_state, (path_array, potential0),
+        )
 
         return env_params, init_state
 
@@ -336,18 +355,28 @@ class RoboTaxiEnv(BaseEnv):
         new_omega = vec[5]
         new_time = env_state.time + 1
 
-        # replan the path every `fps` steps (as in BaseEnv)
-        pred = jnp.mod(new_time, env_params.fps)
-        path_array = jax.lax.cond(
-            pred,
-            lambda _: BaseEnv._find_path(
-                new_pos, env_state.goal_pos, obstacles, env_params
-            ),
-            lambda _: env_state.path_array,
-            None,
-        )
+        if env_params.replan_period == 0:
+            # legacy behaviour (as in BaseEnv): DP inside the step
+            pred = jnp.mod(new_time, env_params.fps)
+            path_array = jax.lax.cond(
+                pred,
+                lambda _: BaseEnv._find_path(
+                    new_pos, env_state.goal_pos, obstacles, env_params
+                ),
+                lambda _: env_state.path_array,
+                None,
+            )
+        else:
+            # fast mode: the path is refreshed outside of the step
+            # (see ``replan``), so a vmapped step does not pay for the DP
+            path_array = env_state.path_array
 
         dist_to_goal = jnp.linalg.norm(new_pos - env_state.goal_pos)
+        # potential of the progress reward: straight-line distance to the goal
+        # (default) or the remaining length of the DP path (progress_on_path)
+        potential = RoboTaxiEnv._progress_potential(
+            new_pos, path_array, env_state.goal_pos, env_params
+        )
 
         new_state = RoboTaxiState(
             time=new_time,
@@ -364,7 +393,7 @@ class RoboTaxiEnv(BaseEnv):
             vel_body=new_vel,
             yaw_rate=new_omega,
             collided=collided,
-            prev_dist_to_goal=dist_to_goal,
+            prev_dist_to_goal=potential,
         )
 
         obs = RoboTaxiEnv.get_observation(new_state, env_params)
@@ -376,7 +405,7 @@ class RoboTaxiEnv(BaseEnv):
         done = jnp.logical_or(goal_done, jnp.logical_or(collision_done, time_done))
 
         reward = RoboTaxiEnv._reward(
-            env_state, new_state, obs, accel, steer, dist_to_goal,
+            env_state, new_state, obs, accel, steer, potential,
             goal_done, collision_done, env_params,
         )
 
@@ -390,6 +419,91 @@ class RoboTaxiEnv(BaseEnv):
             "collision": collision_done,
         }
         return obs, new_state, reward, done, info
+
+    @partial(jax.jit, static_argnames=("env_params",))
+    def replan(
+        env_state: RoboTaxiState, env_params: RoboTaxiParams
+    ) -> RoboTaxiState:
+        """Recompute the DP path from the current position of the vehicle.
+
+        Used together with ``replan_period > 0``: the training loop calls it
+        once every ``replan_period`` env steps for the whole batch of envs.
+        """
+        obstacles = RoboTaxiEnv._planning_obstacles(
+            env_state.static_obstacles, env_state.kinematic_obstacles, env_params
+        )
+        path = BaseEnv._find_path(
+            env_state.agent_pos, env_state.goal_pos, obstacles, env_params
+        )
+        # a new path changes the potential; resetting the stored value keeps
+        # the replanning itself from producing a reward blip
+        potential = RoboTaxiEnv._progress_potential(
+            env_state.agent_pos, path, env_state.goal_pos, env_params
+        )
+        return equinox.tree_at(
+            lambda t: (t.path_array, t.prev_dist_to_goal), env_state, (path, potential)
+        )
+
+    def _plug_slits(init_state, env_params):
+        """Add a wall cell to every free cell that has walls on two opposite sides.
+
+        A car (a point with an obstacle radius of 1) has zero clearance in such a
+        gap: it would have to cross it with a precision of 1e-4 cells. The DP
+        planner does not know that and happily routes through it (on map 2 over
+        the top of the wall in column 10), so the path flips between a feasible
+        and an impassable corridor. Plugging the gap removes the impassable
+        option from the planner, the rays and the collision check at once.
+        Maps 0 and 1 have no such cells and are not changed.
+        """
+        h, w = env_params.map_height_width
+        occ = {(int(round(float(x))), int(round(float(y))))
+               for x, y in np.asarray(init_state.static_obstacles)}
+        keep_free = {
+            tuple(int(round(float(v))) for v in np.asarray(init_state.agent_pos)),
+            tuple(int(round(float(v))) for v in np.asarray(init_state.goal_pos)),
+        }
+        extra = []
+        for x in range(w):
+            for y in range(h):
+                if (x, y) in occ or (x, y) in keep_free:
+                    continue
+                if (((x, y + 1) in occ and (x, y - 1) in occ)
+                        or ((x + 1, y) in occ and (x - 1, y) in occ)):
+                    extra.append((x, y))
+        if not extra:
+            return init_state
+        new_static = jnp.concatenate(
+            [init_state.static_obstacles, jnp.asarray(extra, dtype=jnp.float32)], axis=0
+        )
+        return equinox.tree_at(lambda t: t.static_obstacles, init_state, new_static)
+
+    def _planning_obstacles(static_obstacles, kinematic_obstacles, env_params):
+        """Obstacles seen by the DP planner. With ``plan_static_only`` the moving
+        obstacles are left out: their current cells would block and unblock whole
+        routes from one replan to the next (the path flips between corridors),
+        and avoiding them is the job of the policy (it sees them in the rays)."""
+        if env_params.plan_static_only:
+            return static_obstacles
+        return jnp.concatenate([static_obstacles, kinematic_obstacles], axis=0)
+
+    def _progress_potential(pos, path, goal_pos, env_params):
+        """Potential of the progress reward (smaller = closer to the goal).
+
+        Default: straight-line distance to the goal. With
+        ``progress_on_path``: remaining length of the DP path, i.e. the
+        distance to the closest waypoint plus the length of the path behind it.
+        The straight line is misleading when a wall is in between: the way
+        around starts by moving *away* from the goal.
+        """
+        if not env_params.progress_on_path:
+            return jnp.linalg.norm(pos - goal_pos)
+        seg = jnp.linalg.norm(path[1:] - path[:-1], axis=1)
+        suffix = jnp.concatenate(
+            [jnp.cumsum(seg[::-1])[::-1], jnp.zeros((1,), dtype=seg.dtype)]
+        )
+        d = jnp.linalg.norm(path - pos, axis=1)
+        i = jnp.argmin(d)
+        return d[i] + suffix[i]
 
     # ------------------------------------------------------------------
     # Observation
